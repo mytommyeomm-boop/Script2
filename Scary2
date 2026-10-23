@@ -1,0 +1,328 @@
+--!strict
+-- Aggressive Safe FPS + Perceived-Latency Optimizer
+-- ไม่แตะ: hitbox, ball, character gameplay VFX, cutscene tween
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local Lighting          = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local SoundService      = game:GetService("SoundService")
+local StarterGui        = game:GetService("StarterGui")
+local Stats             = game:GetService("Stats")
+
+local LP         = Players.LocalPlayer
+local PlayerGui  = LP:WaitForChild("PlayerGui")
+local Camera     = workspace.CurrentCamera
+
+local CONFIG = {
+    -- ── Render ──────────────────────────────────────
+    QualityLevel     = 1,        -- 1..10  (Level01 = ต่ำสุด)
+    MeshPartDetail   = 1,        -- 1..4
+    StreamingRadius  = 512,
+    GlobalShadows    = false,    -- ปลอดภัย: cutscene ไม่ tween ตัวนี้
+
+    -- ── Cull ────────────────────────────────────────
+    EmitCullDistance     = 180,  -- forge.emit + StartMeshEmitter
+    ParticleCullDistance = 250,  -- ParticleEmitter/Beam ใน Effects
+
+    -- ── Rate limit ──────────────────────────────────
+    CharImageMaxPerSec   = 20,   -- afterimage ต่อวินาที
+
+    -- ── Camera ──────────────────────────────────────
+    DisableCamLerp       = true, -- unbind "cameraRenderLerpUpdate"
+
+    -- ── Audio ───────────────────────────────────────
+    MuteCharacterSounds  = false,-- ถ้า true จะไม่ได้ยินfootstepศัตรู
+
+    -- ── Auto-fallback ───────────────────────────────
+    AutoAdjust           = true,
+    MinAcceptableFPS     = 40,
+    MaxDrops             = 1,    -- ลดได้กี่ครั้ง
+}
+
+-- ============================================================
+-- Utils
+-- ============================================================
+local function log(...) print("[Opt]", ...) end
+local function safe(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then log("err:", err) end
+    return ok
+end
+
+-- ============================================================
+-- 1) Render settings (ปลอดภัยสุด, cutscene ไม่กระทบ)
+-- ============================================================
+safe(function()
+    settings().Rendering.QualityLevel =
+        Enum.QualityLevel["Level0"..CONFIG.QualityLevel]
+end)
+safe(function()
+    settings().Rendering.MeshPartDetail =
+        Enum.RenderLevel["Level0"..CONFIG.MeshPartDetail]
+end)
+safe(function()
+    settings().Rendering.SavedQualityLevel = CONFIG.QualityLevel
+end)
+safe(function()
+    -- cutscene tween Brightness/ClockTime/Ambient/Atmosphere/ShadowSoftness
+    -- แต่ GlobalShadows เป็นคนละ property → ปลอดภัย
+    Lighting.GlobalShadows = CONFIG.GlobalShadows
+end)
+safe(function()
+    if workspace.StreamingEnabled then
+        workspace.StreamingTargetRadius = CONFIG.StreamingRadius
+    end
+end)
+
+-- ============================================================
+-- 2) ปิด CamMovement Lerp (unbind RenderStep ตรง ๆ)
+-- ============================================================
+if CONFIG.DisableCamLerp then
+    safe(function()
+        RunService:UnbindFromRenderStep("cameraRenderLerpUpdate")
+        log("camera lerp unbound")
+    end)
+end
+
+-- ============================================================
+-- 3) Gameplay whitelist (ห้ามแตะ)
+-- ============================================================
+local GAMEPLAY_KW = {
+    "hit","hitbox","damage","trajectory","traj",
+    "indicator","warn","telegraph","stun","tackle",
+    "ball","goal","shot","strike","flow","awak",
+}
+
+local function isGameplay(inst: Instance): boolean
+    local char = LP.Character
+    if char and inst:IsDescendantOf(char) then return true end
+    local ball = workspace:FindFirstChild("Ball")
+    if ball and inst:IsDescendantOf(ball) then return true end
+    local n = string.lower(inst.Name)
+    for _, kw in ipairs(GAMEPLAY_KW) do
+        if string.find(n, kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function nearCam(pos: Vector3, dist: number): boolean
+    return (pos - Camera.CFrame.Position).Magnitude <= dist
+end
+
+-- ============================================================
+-- 4) Hook forge.emit / emitWithDepth (shared.MOSTRECENTFORGE)
+-- ============================================================
+local function hookForge()
+    task.spawn(function()
+        local t0 = os.clock()
+        repeat task.wait(0.1)
+        until shared.MOSTRECENTFORGE or os.clock() - t0 > 30
+
+        local mrf = shared.MOSTRECENTFORGE
+        if not mrf or mrf._optHooked then return end
+        mrf._optHooked = true
+
+        local origEmit          = mrf.emit
+        local origEmitWithDepth = mrf.emitWithDepth
+
+        local function argsTooFar(...): boolean
+            for _, a in ipairs({...}) do
+                if typeof(a) ~= "Instance" then continue end
+                if isGameplay(a) then return false end
+                local pos: Vector3? = nil
+                if a:IsA("BasePart") then
+                    pos = a.Position
+                elseif a:IsA("Model") and a.PrimaryPart then
+                    pos = a.PrimaryPart.Position
+                elseif a:IsA("Attachment") and a.Parent then
+                    pos = a.WorldPosition
+                end
+                if pos and not nearCam(pos, CONFIG.EmitCullDistance) then
+                    return true
+                end
+            end
+            return false
+        end
+
+        mrf.emit = function(...)
+            if argsTooFar(...) then return end
+            return origEmit(...)
+        end
+        if origEmitWithDepth then
+            mrf.emitWithDepth = function(depth, ...)
+                if argsTooFar(...) then return end
+                return origEmitWithDepth(depth, ...)
+            end
+        end
+        log("forge hooked")
+    end)
+end
+hookForge()
+
+-- ============================================================
+-- 5) Hook characterImage (afterimage throttle)
+-- ============================================================
+safe(function()
+    local rep = ReplicatedStorage:FindFirstChild("client")
+        and ReplicatedStorage.client:FindFirstChild("replication")
+    if not rep then return end
+    local mod = require(rep)
+    if mod._charImgHooked then return end
+    mod._charImgHooked = true
+    local orig = mod.characterImage
+    if type(orig) ~= "function" then return end
+    local minInterval = 1 / CONFIG.CharImageMaxPerSec
+    local lastCall = 0
+    mod.characterImage = function(args)
+        local now = os.clock()
+        if now - lastCall < minInterval then return end
+        lastCall = now
+        return orig(args)
+    end
+    log("characterImage throttled")
+end)
+
+-- ============================================================
+-- 6) Hook MeshEmitter.StartMeshEmitter (distance cull)
+-- ============================================================
+safe(function()
+    local rep = ReplicatedStorage:FindFirstChild("client")
+        and ReplicatedStorage.client:FindFirstChild("replication")
+    if not rep then return end
+    local mesh = rep:FindFirstChild("MeshEmitter")
+    if not mesh then return end
+    local mod = require(mesh)
+    if mod._optHooked then return end
+    mod._optHooked = true
+    local orig = mod.StartMeshEmitter
+    mod.StartMeshEmitter = function(root, ...)
+        if typeof(root) == "Instance"
+            and (root:IsA("BasePart") or root:IsA("Model"))
+        then
+            if not isGameplay(root) then
+                local p = root:IsA("BasePart")
+                    and root.Position or root:GetPivot().Position
+                if not nearCam(p, CONFIG.EmitCullDistance) then
+                    local dummy = Instance.new("Model")
+                    dummy.Parent = workspace.Effects
+                    task.delay(0.15, function() dummy:Destroy() end)
+                    return dummy
+                end
+            end
+        end
+        return orig(root, ...)
+    end
+    log("MeshEmitter hooked")
+end)
+
+-- ============================================================
+-- 7) Distance cull particle/beam ใน Effects (Heartbeat)
+-- ============================================================
+local culledSet: {[Instance]: boolean}   = {}
+local origStates: {[Instance]: boolean}  = {}
+
+local function cullStep()
+    local effects = workspace:FindFirstChild("Effects")
+    if not effects then return end
+    for _, inst in ipairs(effects:GetChildren()) do
+        if isGameplay(inst) then continue end
+        local pos: Vector3? = nil
+        if inst:IsA("BasePart") then pos = inst.Position
+        elseif inst:IsA("Model") and inst.PrimaryPart then
+            pos = inst.PrimaryPart.Position
+        end
+        if not pos then continue end
+        local far = not nearCam(pos, CONFIG.ParticleCullDistance)
+        for _, d in ipairs(inst:GetDescendants()) do
+            if not (d:IsA("ParticleEmitter") or d:IsA("Beam")) then
+                continue
+            end
+            if isGameplay(d) then continue end
+            if far and not culledSet[d] then
+                culledSet[d] = true
+                origStates[d] = d.Enabled
+                d.Enabled = false
+            elseif not far and culledSet[d] then
+                d.Enabled = origStates[d] ~= false
+                culledSet[d] = nil
+                origStates[d] = nil
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- 8) Audio cleanup (optional)
+-- ============================================================
+if CONFIG.MuteCharacterSounds then
+    safe(function()
+        for _, s in workspace:GetDescendants() do
+            if s:IsA("Sound")
+                and (s.Name == "Running"
+                    or s.Name:match("^RbxCharacterSounds"))
+            then
+                s.Volume = 0
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- 9) Auto-fallback
+-- ============================================================
+local frameTimes: {number} = {}
+local drops = 0
+
+local function onRender(dt: number)
+    table.insert(frameTimes, dt)
+    if #frameTimes > 60 then table.remove(frameTimes, 1) end
+    if not CONFIG.AutoAdjust or #frameTimes < 40 then return end
+
+    local sum = 0
+    for _, t in ipairs(frameTimes) do sum = sum + t end
+    local fps = #frameTimes / sum
+
+    if fps < CONFIG.MinAcceptableFPS and drops < CONFIG.MaxDrops then
+        drops += 1
+        safe(function()
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        end)
+        log(("auto-drop → Level01 (fps=%.0f)"):format(fps))
+    end
+end
+
+-- ============================================================
+-- 10) Public API
+-- ============================================================
+local API = {}
+function API.GetFPS(): number
+    if #frameTimes == 0 then return 0 end
+    local sum = 0
+    for _, t in ipairs(frameTimes) do sum = sum + t end
+    return math.floor(#frameTimes / sum)
+end
+function API.GetPing(): number
+    local ok, p = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    return ok and p or 0
+end
+function API.SetQuality(lvl: number)
+    CONFIG.QualityLevel = math.clamp(lvl, 1, 10)
+    safe(function()
+        settings().Rendering.QualityLevel =
+            Enum.QualityLevel["Level0"..CONFIG.QualityLevel]
+    end)
+end
+function API.RestoreCull()
+    for d in pairs(culledSet) do
+        if d.Parent then d.Enabled = origStates[d] ~= false end
+    end
+    table.clear(culledSet); table.clear(origStates)
+end
+
+RunService.RenderStepped:Connect(onRender)
+RunService.Heartbeat:Connect(cullStep)
+
+log("initialized, quality =", CONFIG.QualityLevel)
+return API
